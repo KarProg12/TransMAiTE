@@ -21,6 +21,7 @@ class Converter:
         # Te statusy znacza: "juz przetlumaczone, nie ruszaj"
         self.TRANSLATED_STATUSES = ["Translated", "ApprovedTranslation", "ApprovedSignOff", "RejectedTranslation", "RejectedSignOff"]
 
+        # Zliczane segmenty (większość do logów w konsoli tylko chaged_by_user jest wyświetlane w GUI)
         self.changed_by_user = 0
         self.unchanged_segments = 0
         self.empty_segments = 0
@@ -34,7 +35,7 @@ class Converter:
             json.dump(data, file, ensure_ascii=False, indent=2)
 
     def find_markers(self, parent):
-        # {mid: <mrk>} tylko dla znacznikow segmentow, None -> pusty slownik
+        # {mid: <mrk>} tylko dla znacznikow segmentow, None -> pusty słownik
         if parent is None:
             return {}
         return {str(m.get("mid")): m for m in parent.findall(".//xliff:mrk", self.NAMESPACES) if m.get("mtype") == "seg" and m.get("mid") is not None}
@@ -83,7 +84,8 @@ class Converter:
     def export_to_json_and_txts(self, sdlxliff_file, output_folder):
         """Reads .sdlxliff and saves export.json in the given folder."""
         segments = []
-        # Czytami plik XML po jednym trans-unit
+        repetitions = {}
+        # Czytami plik XML po jednym trans-unit, _ znaczy nie obchodzi mnie wartość-klucz
         for _, trans_unit in ET.iterparse(sdlxliff_file, events=('end',)):
             if not trans_unit.tag.endswith("}trans-unit"):
                 continue
@@ -100,12 +102,19 @@ class Converter:
                 status, locked = statuses[seg_id]
                 if locked == "true" or status in self.TRANSLATED_STATUSES:
                     continue
-                segments.append({"trans-unit_id": str(trans_unit.get("id")), "seg_id": seg_id, "status": status or "Not Translated",
-                                 "source": self.text_from_element(marker), "target": old_translations.get(seg_id, "")})
+                source_text = self.text_from_element(marker)
+                if source_text not in repetitions:
+                    repetitions[source_text] = []
+                    segments.append({"trans-unit_id": str(trans_unit.get("id")), "seg_id": seg_id, "status": status or "Not Translated",
+                                    "source": self.text_from_element(marker), "target": old_translations.get(seg_id, "")})
+                repetitions[source_text].append((str(trans_unit.get("id")), seg_id))
             trans_unit.clear()
+
+        repetitions = {text: ids for text, ids in repetitions.items() if len(ids) > 1}
+        print(f"Repetitions: {len(repetitions)}")
         # Zapisujemy do pliku JSON
         os.makedirs(output_folder, exist_ok=True)
-        self.write_json(os.path.join(output_folder, "export.json"), {"segments": segments})
+        self.write_json(os.path.join(output_folder, "export.json"), {"segments": segments, "repetitions": repetitions})
         print("Done! Exported", len(segments), "segments.")
 
         # Otwiera 2 pliki source i target .txt, w source.txt są wszystkie wyciągnięte segmenty
@@ -124,13 +133,25 @@ class Converter:
         if not os.path.exists(backup_file):
             shutil.copy(sdlxliff_file, backup_file)
         data = self.read_json(json_file)
+        repetitions = data.get("repetitions", {})
         # Slownik: (id_jednostki, id_segmentu) -> tlumaczenie
-        translations = {(str(s["trans-unit_id"]), str(s["seg_id"])): s.get("target", "").strip() for s in data["segments"] if s.get("target", "").strip()}
+        translations = {}
+        propagated_ids = set()
+        for s in data["segments"]:
+            target_text = s.get("target", "").strip()
+            if not target_text:
+                continue
+            translations[(str(s["trans-unit_id"]), str(s["seg_id"]))] = target_text
+            source_text = s.get("source", "")
+            if source_text in repetitions:
+                for tu_id, seg_id in repetitions[source_text][1:]:
+                    key = (str(tu_id)), str(seg_id)
+                    translations[key] = target_text
+                    propagated_ids.add(key)
+
         tree = ET.parse(sdlxliff_file)
         root = tree.getroot()
-        inserted = 0
-        skipped = 0
-        changed_by_user = 0
+        inserted, skipped, changed_by_user = 0, 0, 0
         for trans_unit in root.findall(".//xliff:trans-unit", self.NAMESPACES):
             trans_unit_id = str(trans_unit.get("id"))
             target_element = trans_unit.find("xliff:target", self.NAMESPACES)
@@ -139,7 +160,6 @@ class Converter:
                 skipped += 1
                 continue
             markers = self.find_markers(target_element)  # Znajdz istniejace znaczniki <mrk> w celu: id -> element
-            sources = {mid: self.text_from_element(m) for mid, m in self.find_markers(trans_unit.find("xliff:seg-source", self.NAMESPACES)).items()}
             for seg_def in seg_defs.findall("sdl:seg", self.NAMESPACES):
                 seg_id = seg_def.get("id")
                 if seg_id is None:  # seg bez id - nie da sie go dopasowac do tlumaczenia
@@ -152,18 +172,12 @@ class Converter:
                     markers[seg_id].set("mid", seg_id)
                 marker = markers[seg_id]
                 new_text = translations[(trans_unit_id, seg_id)]
-                old_text = self.text_from_element(marker)
-                if old_text != new_text:
+                if self.text_from_element(marker) != new_text:
                     changed_by_user += 1
-                source_text = sources.get(seg_id, "")
-                if source_text.count("<") != new_text.count("<"):
-                    print(f"WARNING: different number of tags in segment {seg_id}")
-                    print(f"Source: {source_text}")
-                    print(f"Translation: {new_text}")
                 # Czyscimy stary tekst, ale zachowujemy atrybuty
-                old_attributes, old_tail = dict(marker.attrib), marker.tail
+                old_attribs, old_tail = dict(marker.attrib), marker.tail
                 marker.clear()
-                for name, value in old_attributes.items():
+                for name, value in old_attribs.items():
                     marker.set(name, value)
                 marker.set("mtype", "seg")
                 marker.set("mid", seg_id)
@@ -178,6 +192,8 @@ class Converter:
                 except ET.ParseError:
                     marker.text = new_text
                 seg_def.set("conf", "Draft")
+                if (trans_unit_id, seg_id) in propagated_ids:
+                    seg_def.set("origin", "auto-propagated")
                 inserted += 1
         # Rejestrujemy przestrzenie nazw, zeby plik wygladal ladnie
         ET.register_namespace("sdl", "http://sdl.com/FileTypes/SdlXliff/1.0")
