@@ -126,6 +126,55 @@ class Converter:
         print("TXT done.")
         return len(segments)
 
+    def export_many(self, sdlxliff_files, output_folder):
+        segments = []
+        repetitions = {}
+        for sdlxliff_file in sdlxliff_files:
+            # Czytami plik XML po jednym trans-unit, _ znaczy nie obchodzi mnie wartość-klucz
+            for _, trans_unit in ET.iterparse(sdlxliff_file, events=('end',)):
+                if not trans_unit.tag.endswith("}trans-unit"):
+                    continue
+                source_element = trans_unit.find("xliff:seg-source", self.NAMESPACES)
+                seg_defs = trans_unit.find("sdl:seg-defs", self.NAMESPACES)
+                if source_element is None or seg_defs is None:
+                    trans_unit.clear()
+                    continue
+                statuses = {str(s.get("id")): [s.get("conf"), s.get("locked")] for s in
+                            seg_defs.findall("sdl:seg", self.NAMESPACES) if s.get("id") is not None}
+                old_translations = {mid: self.text_from_element(m) for mid, m in
+                                    self.find_markers(trans_unit.find("xliff:target", self.NAMESPACES)).items()}
+                for seg_id, marker in self.find_markers(source_element).items():
+                    if seg_id not in statuses:
+                        continue
+                    status, locked = statuses[seg_id]
+                    if locked == "true" or status in self.TRANSLATED_STATUSES:
+                        continue
+                    source_text = self.text_from_element(marker)
+                    if source_text not in repetitions:
+                        repetitions[source_text] = []
+                        segments.append({"file": sdlxliff_file, "trans-unit_id": str(trans_unit.get("id")), "seg_id": seg_id,
+                                         "status": status or "Not Translated",
+                                         "source": self.text_from_element(marker),
+                                         "target": old_translations.get(seg_id, "")})
+                    repetitions[source_text].append((sdlxliff_file, str(trans_unit.get("id")), seg_id))
+                trans_unit.clear()
+
+        repetitions = {text: ids for text, ids in repetitions.items() if len(ids) > 1}
+        print(f"Repetitions: {len(repetitions)}")
+        # Zapisujemy do pliku JSON
+        os.makedirs(output_folder, exist_ok=True)
+        self.write_json(os.path.join(output_folder, "export.json"), {"segments": segments, "repetitions": repetitions})
+        print("Done! Exported", len(segments), "segments.")
+
+        # Otwiera 2 pliki source i target .txt, w source.txt są wszystkie wyciągnięte segmenty
+        # a target.txt jest pusty bo czeka na wklejenie przetłumaczonego tekstu
+        with open(os.path.join(output_folder, "source.txt"), "w", encoding="utf-8") as source_file:
+            with open(os.path.join(output_folder, "target.txt"), "w", encoding="utf-8") as target_file:
+                for segment in segments:
+                    source_file.write(segment["source"].replace("\n", "\\n") + "\n")
+        print("TXT done.")
+        return len(segments)
+
     def import_to_sdlxliff(self, sdlxliff_file, json_file, output_file):
         """Inserts translations from JSON back into the .sdlxliff file."""
         backup_folder = os.path.dirname(json_file)
@@ -141,11 +190,18 @@ class Converter:
             target_text = s.get("target", "").strip()
             if not target_text:
                 continue
-            translations[(str(s["trans-unit_id"]), str(s["seg_id"]))] = target_text
+            if s.get("file", sdlxliff_file) == sdlxliff_file:
+                translations[(str(s["trans-unit_id"]), str(s["seg_id"]))] = target_text
             source_text = s.get("source", "")
             if source_text in repetitions:
-                for tu_id, seg_id in repetitions[source_text][1:]:
-                    key = (str(tu_id)), str(seg_id)
+                for rep in repetitions[source_text][1:]:
+                    if len(rep) == 3:
+                        rep_file, tu_id, seg_id = rep
+                        if rep_file != sdlxliff_file:
+                            continue
+                    else:
+                        tu_id, seg_id = rep
+                    key = (str(tu_id), str(seg_id))
                     translations[key] = target_text
                     propagated_ids.add(key)
 
@@ -217,21 +273,46 @@ class Converter:
             print("ERROR: the number of lines in the TXT does not match the number of segments!\n"
                   f"TXT lines: {len(lines)}\n"
                   f"JSON segments: {len(data['segments'])}")
-            return 0
-        self.changed_by_user = self.unchanged_segments = self.empty_segments = 0
+            return -1
+
+        changed_by_user = 0
+        unchanged_segments = 0
+        empty_segments = 0
+
         for segment, text in zip(data["segments"], lines):
             old_text = segment.get("target") or ""
             if not text.strip():
-                self.empty_segments += 1
+                empty_segments += 1
                 segment["target"] = ""
             elif old_text != text:
                 segment["target"] = text
-                self.changed_by_user += 1
+                changed_by_user += 1
             else:
-                self.unchanged_segments += 1
+                unchanged_segments += 1
+
+        self.changed_by_user = changed_by_user
+        self.unchanged_segments = unchanged_segments
+        self.empty_segments = empty_segments
+
         self.write_json(json_file, data)
-        print(f"TXT -> JSON: segments changed by user: {self.changed_by_user}, unchanged segments {self.unchanged_segments}, empty segments {self.empty_segments} / total {len(data['segments'])}")
-        return self.changed_by_user
+        print(
+            f"TXT -> JSON: segments changed by user: {changed_by_user}, unchanged segments {unchanged_segments}, empty segments {empty_segments} / total {len(data['segments'])}")
+        return changed_by_user
+
+    def import_many(self, txt_file, json_file):
+        changed = self.import_txt_to_json(txt_file, json_file)
+        if changed == -1:
+            return 0
+        data = self.read_json(json_file)
+        files = {s["file"] for s in data["segments"] if s.get("file")}
+        for rep_list in data.get("repetitions", {}).values():
+            for rep in rep_list:
+                if len(rep) == 3:
+                    files.add(rep[0])
+        total = 0
+        for f in files:
+            total += self.import_to_sdlxliff(f, json_file, f)
+        return total
 
     def import_txt_to_sdlxliff(self, txt_file, json_file, sdlxliff_file):
         self.import_txt_to_json(txt_file, json_file)
